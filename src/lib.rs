@@ -156,7 +156,6 @@ mod frame;
 #[cfg_attr(docsrs, doc(cfg(feature = "upgrade")))]
 pub mod handshake;
 mod mask;
-mod recv;
 /// HTTP upgrades.
 #[cfg(feature = "upgrade")]
 #[cfg_attr(docsrs, doc(cfg(feature = "upgrade")))]
@@ -172,7 +171,6 @@ pub use crate::frame::Frame;
 pub use crate::frame::OpCode;
 pub use crate::frame::Payload;
 pub use crate::mask::unmask;
-use crate::recv::SharedRecv;
 
 #[derive(Copy, Clone, PartialEq)]
 pub enum Role {
@@ -204,9 +202,9 @@ pub struct WebSocket<S> {
   stream: S,
   write_half: WriteHalf,
   read_half: ReadHalf,
-  // !Sync marker
-  _marker: std::marker::PhantomData<SharedRecv>,
 }
+
+const RECV_SIZE: usize = 16384;
 
 impl<'f, S> WebSocket<S> {
   /// Creates a new `WebSocket` from a stream that has already completed the WebSocket handshake.
@@ -232,7 +230,6 @@ impl<'f, S> WebSocket<S> {
   where
     S: AsyncReadExt + AsyncWriteExt + Unpin,
   {
-    recv::init_once();
     Self {
       stream,
       write_half: WriteHalf {
@@ -252,7 +249,6 @@ impl<'f, S> WebSocket<S> {
         writev_threshold: 1024,
         max_message_size: 64 << 20,
       },
-      _marker: std::marker::PhantomData,
     }
   }
 
@@ -332,7 +328,7 @@ impl<'f, S> WebSocket<S> {
     frame: Frame<'f>,
   ) -> Result<(), WebSocketError>
   where
-    S: AsyncReadExt + AsyncWriteExt + Unpin,
+    S: AsyncReadExt + AsyncWriteExt + Unpin + Send,
   {
     self.write_half.write_frame(&mut self.stream, frame).await?;
     Ok(())
@@ -366,7 +362,7 @@ impl<'f, S> WebSocket<S> {
   /// ```
   pub async fn read_frame(&mut self) -> Result<Frame<'f>, WebSocketError>
   where
-    S: AsyncReadExt + AsyncWriteExt + Unpin,
+    S: AsyncReadExt + AsyncWriteExt + Unpin + Send,
   {
     loop {
       let (res, obligated_send) =
@@ -474,13 +470,8 @@ impl ReadHalf {
       }};
     }
 
-    let head = recv::init_once();
-    let mut nread = 0;
-
-    if let Some(spill) = self.spill.take() {
-      head[..spill.len()].copy_from_slice(&spill);
-      nread += spill.len();
-    }
+    let mut nread = self.spill.as_ref().map(|v| v.len()).unwrap_or(0);
+    let mut head = self.spill.take().unwrap_or(vec![0u8; RECV_SIZE]);
 
     while nread < 2 {
       nread += eof!(stream.read(&mut head[nread..]).await?);
@@ -546,7 +537,7 @@ impl ReadHalf {
     let required = 2 + extra + mask.map(|_| 4).unwrap_or(0) + length;
     if required > nread {
       // Allocate more space
-      let mut new_head = head.to_vec();
+      let mut new_head = head.clone();
       new_head.resize(required, 0);
 
       stream.read_exact(&mut new_head[nread..]).await?;
@@ -561,12 +552,8 @@ impl ReadHalf {
       self.spill = Some(head[required..nread].to_vec());
     }
 
-    let payload = &mut head[required - length..required];
-    let payload = if payload.len() > self.writev_threshold {
-      Payload::BorrowedMut(payload)
-    } else {
-      Payload::Owned(payload.to_vec())
-    };
+    let payload = &head[required - length..required];
+    let payload = Payload::Owned(payload.to_vec());
     let frame = Frame::new(fin, opcode, mask, payload);
     Ok(frame)
   }
@@ -580,7 +567,7 @@ impl WriteHalf {
     mut frame: Frame<'a>,
   ) -> Result<(), WebSocketError>
   where
-    S: AsyncWriteExt + Unpin,
+    S: AsyncWriteExt + Unpin + Send,
   {
     if self.role == Role::Client && self.auto_apply_mask {
       frame.mask();
